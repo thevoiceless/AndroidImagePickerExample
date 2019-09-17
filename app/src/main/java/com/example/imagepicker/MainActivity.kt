@@ -12,6 +12,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import com.squareup.picasso.MemoryPolicy
 import com.squareup.picasso.Picasso
+import io.reactivex.Completable
 import io.reactivex.Single
 import io.reactivex.android.schedulers.AndroidSchedulers
 import io.reactivex.schedulers.Schedulers
@@ -20,6 +21,7 @@ import timber.log.Timber
 import java.io.File
 
 class MainActivity : AppCompatActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -31,7 +33,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         imagesCamera.setOnClickListener {
-            camera()
+            capture()
         }
     }
 
@@ -55,32 +57,27 @@ class MainActivity : AppCompatActivity() {
      * https://commonsware.com/blog/2016/03/15/how-consume-content-uri.html
      */
     private fun onImagePicked(uri: Uri) {
-        // Create a temp file in our cache dir so that we can work with the data
-        val mimeType = contentResolver.getType(uri)!!
-        val extension = mimeType.removeRange(0, mimeType.indexOf('/') + 1)
-
-        val tempFileName = "photoFromGallery.$extension"
-        val tempFile = File(cacheDir, tempFileName)
-
-        val inputStream = contentResolver.openInputStream(uri)!!
-        val outputStream = tempFile.outputStream()
-
-        inputStream.use { input ->
-            outputStream.use { output ->
-                input.copyTo(output)
+        saveToFile(uri)
+            .subscribeOn(Schedulers.io())
+            .flatMap { resizeIfNecessary(it) }
+            .doOnSuccess { imageFile ->
+                Timber.i("File name: ${imageFile.name}")
+                Timber.i("File size: ${imageFile.length()}")
             }
-        }
-
-        doStuff(tempFile)
+            .doOnError { throwable -> Timber.e(throwable) }
+            .flatMapCompletable { imageFile -> Completable.fromAction { imageFile.delete() } }
+            .onErrorComplete()
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe()
     }
 
     /**
      * https://developer.android.com/training/camera/photobasics#TaskPath
      */
-    private fun camera() {
-        // Easiest approach is not to make the picture available to all apps (requires no permissions)
-        val tempFileName = "photoFromCamera.jpg"
-        val tempFile = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), tempFileName)
+    private fun capture() {
+        // Easiest approach is NOT to make the picture available to all apps (requires no permissions)
+        // Instead, save into a file inside our app storage dir
+        val tempFile = getFileForCamera()
 
         Intent(MediaStore.ACTION_IMAGE_CAPTURE).also { takePictureIntent ->
             takePictureIntent.resolveActivity(packageManager)?.let {
@@ -97,74 +94,90 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onImageCaptured() {
-        // We know the file we created
-        val tempFileName = "photoFromCamera.jpg"
-        val tempFile = File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), tempFileName)
-
-        doStuff(tempFile)
+        Single.fromCallable { getFileForCamera() }
+            .subscribeOn(Schedulers.io())
+            .flatMap { resizeIfNecessary(it) }
+            .doOnSuccess { imageFile ->
+                Timber.i("File name: ${imageFile.name}")
+                Timber.i("File size: ${imageFile.length()}")
+            }
+            .doOnError { throwable -> Timber.e(throwable) }
+            .flatMapCompletable { imageFile -> Completable.fromAction { imageFile.delete() } }
+            .onErrorComplete()
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe()
     }
 
-    private fun doStuff(tempFile: File) {
-        var resizedFile: File? = null
+    private fun saveToFile(uri: Uri): Single<File> {
+        return Single.fromCallable {
+            // Create a temp file in our cache dir so that we can work with the data
+            val mimeType = contentResolver.getType(uri)!!
+            val extension = mimeType.removeRange(0, mimeType.indexOf('/') + 1)
+            val tempFile = getFileForUri(extension)
 
-        /*
-        Resize if needed
-         */
-        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(tempFile.absolutePath, options)
-        val (width, height) = options.outWidth to options.outHeight
-        // Or....
-        val fileSizeBytes = tempFile.length()
+            val inputStream = contentResolver.openInputStream(uri)!!
+            val outputStream = tempFile.outputStream()
 
-        val imageFileToUse = if (fileSizeBytes > TWENTY_MB_IN_BYTES) {
-            Timber.i("File is $fileSizeBytes - resizing...")
-            // Resize
-            val preserveAspectRatio = true
-            val onlyScaleDown = true
+            inputStream.use { input ->
+                outputStream.use { output ->
+                    input.copyTo(output)
+                }
+            }
 
-            Single.fromCallable {
-                Picasso.get()
-                    .load(tempFile)
-                    .resize(RESIZE_DIMEN, RESIZE_DIMEN)
-                    .apply { if (preserveAspectRatio) centerInside() }
-                    .apply { if (onlyScaleDown) onlyScaleDown() }
-                    .memoryPolicy(MemoryPolicy.NO_CACHE, MemoryPolicy.NO_STORE)
-                    .get()
-            }.flatMap { resizedBitmap ->
+            tempFile
+        }
+    }
+
+    private fun getFileForUri(extension: String): File {
+        return File(cacheDir, "photoForUri.$extension")
+    }
+
+    private fun getFileForCamera(): File {
+        return File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "photoFromCamera.jpg")
+    }
+
+    private fun resizeIfNecessary(tempFile: File): Single<File> {
+        return Single.fromCallable {
+            // Resize if needed
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(tempFile.absolutePath, options)
+            val (width, height) = options.outWidth to options.outHeight
+            // Or....
+            val fileSizeBytes = tempFile.length()
+
+            if (fileSizeBytes > TWENTY_MB_IN_BYTES) {
+                Timber.i("File is $fileSizeBytes - resizing...")
+                // Resize
+                val preserveAspectRatio = true
+                val onlyScaleDown = true
+
+                val resizedBitmap = Picasso.get()
+                        .load(tempFile)
+                        .resize(RESIZE_DIMEN, RESIZE_DIMEN)
+                        .apply { if (preserveAspectRatio) centerInside() }
+                        .apply { if (onlyScaleDown) onlyScaleDown() }
+                        .memoryPolicy(MemoryPolicy.NO_CACHE, MemoryPolicy.NO_STORE)
+                        .get()
+
                 val resizedExtension = when (tempFile.extension.toLowerCase()) {
                     "jpeg", "jpg" -> "jpeg"
                     else -> "png"
                 }
 
                 val resizedFileName = "${tempFile.nameWithoutExtension}-resized.$resizedExtension"
-                resizedFile = File(cacheDir, resizedFileName).also {
+                val resizedFile = File(cacheDir, resizedFileName).also {
                     it.outputStream().use { resizedOutput ->
                         val format = if (resizedExtension == "jpeg") Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG
                         resizedBitmap.compress(format, 99, resizedOutput)
                     }
                 }
+                tempFile.delete()
 
-                Single.just(resizedFile!!)
+                resizedFile
+            } else {
+                tempFile
             }
-        } else {
-            Single.just(tempFile)
         }
-
-        imageFileToUse.subscribeOn(Schedulers.io())
-            .observeOn(AndroidSchedulers.mainThread())
-            .doAfterTerminate { cleanUp(tempFile, resizedFile) }
-            .subscribe({ imageFile ->
-                // Do stuff with the file
-                Timber.i("File name: ${imageFile.name}")
-                Timber.i("File size: ${imageFile.length()}")
-            }, { throwable ->
-                Timber.e(throwable, "Error")
-            })
-
-    }
-
-    private fun cleanUp(vararg files: File?) {
-        files.forEach { file -> file?.let { runCatching { it.delete() } } }
     }
 
     companion object {
